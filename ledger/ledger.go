@@ -198,7 +198,17 @@ func (l *Ledger) loadGenesisBlock() error {
 		l.meta.MaxBlockSize = l.GenesisBlock.GetConfig().GetMaxBlockSizeInByte()
 	}
 	if l.meta.ReservedContracts == nil {
-		l.meta.ReservedContracts, _ = l.GenesisBlock.GetConfig().GetReservedContract()
+		l.meta.ReservedContracts, gErr = l.GenesisBlock.GetConfig().GetReservedContract()
+		if gErr != nil {
+			return gErr
+		}
+	}
+	if l.meta.ForbiddenContract == nil {
+		forbiddenContractArr, gErr := l.GenesisBlock.GetConfig().GetForbiddenContract()
+		if gErr != nil || len(forbiddenContractArr) <= 0 {
+			return gErr
+		}
+		l.meta.ForbiddenContract = forbiddenContractArr[0]
 	}
 	return nil
 }
@@ -503,6 +513,30 @@ func (l *Ledger) UpdateReservedContract(params []*pb.InvokeRequest, batch kvdb.B
 
 	l.meta = newMeta
 	l.xlog.Info("Update reservered contract", "reservedContracts", l.meta.ReservedContracts)
+	return nil
+}
+
+// UpdateForbiddenContract update forbidden contract param
+func (l *Ledger) UpdateForbiddenContract(param *pb.InvokeRequest, batch kvdb.Batch) error {
+	if param == nil {
+		return fmt.Errorf("invalid forbidden contract request")
+	}
+
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+
+	newMeta := proto.Clone(l.meta).(*pb.LedgerMeta)
+	newMeta.ForbiddenContract = param
+
+	metaBuf, pbErr := proto.Marshal(newMeta)
+	if pbErr != nil {
+		l.xlog.Warn("failed to marshal pb meta")
+		return pbErr
+	}
+	batch.Put([]byte(pb.MetaTablePrefix), metaBuf)
+
+	l.meta = newMeta
+	l.xlog.Info("Update forbidden contract", "forbiddenContract", l.meta.ForbiddenContract)
 	return nil
 }
 
@@ -1024,6 +1058,73 @@ func (l *Ledger) MaxTxSizePerBlock() int {
 	return int(maxBlkSize * TxSizePercent)
 }
 
+// GetBaseDB get internal db instance
 func (l *Ledger) GetBaseDB() kvdb.Database {
 	return l.baseDB
+}
+
+func (l *Ledger) removeBlocks(fromBlockid []byte, toBlockid []byte, batch kvdb.Batch) error {
+	fromBlock, findErr := l.fetchBlock(fromBlockid)
+	if findErr != nil {
+		l.xlog.Warn("failed to find block", "findErr", findErr)
+		return findErr
+	}
+	toBlock, findErr := l.fetchBlock(toBlockid)
+	if findErr != nil {
+		l.xlog.Warn("failed to find block", "findErr", findErr)
+		return findErr
+	}
+	for fromBlock.Height > toBlock.Height {
+		l.xlog.Info("remove block", "blockid", global.F(fromBlock.Blockid), "height", fromBlock.Height)
+		l.blkHeaderCache.Del(string(fromBlock.Blockid))
+		batch.Delete(append([]byte(pb.BlocksTablePrefix), fromBlock.Blockid...))
+		if fromBlock.InTrunk {
+			sHeight := []byte(fmt.Sprintf("%020d", fromBlock.Height))
+			batch.Delete(append([]byte(pb.BlockHeightPrefix), sHeight...))
+		}
+		//iter to prev block
+		fromBlock, findErr = l.fetchBlock(fromBlock.PreHash)
+		if findErr != nil {
+			l.xlog.Warn("failed to find prev block", "findErr", findErr)
+			return findErr
+		}
+	}
+	return nil
+}
+
+// Truncate truncate ledger and set tipblock to utxovmLastID
+func (l *Ledger) Truncate(utxovmLastID []byte) error {
+	batchWrite := l.baseDB.NewBatch()
+
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+
+	newMeta := proto.Clone(l.meta).(*pb.LedgerMeta)
+	newMeta.TipBlockid = utxovmLastID
+	block, findErr := l.fetchBlock(utxovmLastID)
+	if findErr != nil {
+		l.xlog.Warn("failed to find utxovm last block", "findErr", findErr)
+		return findErr
+	}
+	rmErr := l.removeBlocks(l.meta.TipBlockid, block.Blockid, batchWrite)
+	if rmErr != nil {
+		l.xlog.Warn("failed to remove garbage blocks", "from", global.F(l.meta.TipBlockid), "to", global.F(block.Blockid))
+		return rmErr
+	}
+	newMeta.TrunkHeight = block.Height
+	metaBuf, pbErr := proto.Marshal(newMeta)
+	if pbErr != nil {
+		l.xlog.Warn("failed to marshal pb meta")
+		return pbErr
+	}
+	batchWrite.Put([]byte(pb.MetaTablePrefix), metaBuf)
+	kvErr := batchWrite.Write()
+	if kvErr != nil {
+		l.xlog.Warn("batch write failed when Truncate", "kvErr", kvErr)
+		return kvErr
+	}
+
+	l.meta = newMeta
+	l.xlog.Info("truncate blockid succeed")
+	return nil
 }
